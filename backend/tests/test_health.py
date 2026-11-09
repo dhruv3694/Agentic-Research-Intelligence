@@ -66,6 +66,13 @@ def test_configuration_defaults():
         {"ollama_num_ctx": 0},
         {"ollama_base_url": "http://user:password@localhost:11434"},
         {"ollama_model": "  "},
+        {"search_provider": "proprietary"},
+        {"searxng_base_url": "file:///tmp/search"},
+        {"searxng_base_url": "https://example.org/search-path"},
+        {"search_timeout": 0},
+        {"search_max_results": 21},
+        {"research_max_subquestions": 0},
+        {"research_max_concurrent_searches": 11},
     ],
 )
 def test_invalid_ollama_configuration_is_rejected(values):

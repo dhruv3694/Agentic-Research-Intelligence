@@ -13,6 +13,14 @@ from backend.app.schemas.llm import APIError, APIErrorDetail
 from backend.app.services.llm.base import LLMProviderError
 from backend.app.services.llm.manager import LLMManager
 from backend.app.services.llm.ollama_provider import OllamaProvider
+from backend.app.services.research.planner import ResearchPlanner
+from backend.app.services.research.retrieval import ResearchRetrievalService
+from backend.app.services.research.source_processor import SourceProcessor
+from backend.app.services.search.base import (
+    DisabledSearchProvider,
+    SearchProviderError,
+)
+from backend.app.services.search.providers.searxng import SearXNGSearchProvider
 
 logger = get_logger(__name__)
 
@@ -21,6 +29,13 @@ def create_ollama_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=settings.ollama_base_url,
         timeout=httpx.Timeout(settings.ollama_timeout),
+    )
+
+
+def create_searxng_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=settings.searxng_base_url,
+        timeout=httpx.Timeout(settings.search_timeout),
     )
 
 
@@ -34,10 +49,29 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         num_ctx=settings.ollama_num_ctx,
     )
     application.state.llm_manager = LLMManager(provider, settings.ollama_model)
+    application.state.research_planner = ResearchPlanner(
+        provider,
+        settings.research_max_subquestions,
+    )
+    search_client: httpx.AsyncClient | None = None
+    if settings.search_provider == "searxng":
+        search_client = create_searxng_http_client()
+        search_provider = SearXNGSearchProvider(search_client, settings.search_max_results)
+    else:
+        search_provider = DisabledSearchProvider()
+    application.state.search_provider = search_provider
+    application.state.research_retrieval_service = ResearchRetrievalService(
+        search_provider=search_provider,
+        source_processor=SourceProcessor(),
+        max_results=settings.search_max_results,
+        max_concurrent_searches=settings.research_max_concurrent_searches,
+    )
     logger.info("Application startup complete.")
     try:
         yield
     finally:
+        if search_client is not None:
+            await search_client.aclose()
         await http_client.aclose()
         logger.info("Application shutdown complete.")
 
@@ -80,6 +114,20 @@ async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONRespons
 @app.exception_handler(LLMProviderError)
 async def llm_provider_exception_handler(_: Request, exc: LLMProviderError) -> JSONResponse:
     logger.warning("Language model provider error (%s).", exc.code)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=APIError(
+            error=APIErrorDetail(code=exc.code, message=exc.public_message)
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(SearchProviderError)
+async def search_provider_exception_handler(
+    _: Request,
+    exc: SearchProviderError,
+) -> JSONResponse:
+    logger.warning("Search provider error (%s).", exc.code)
     return JSONResponse(
         status_code=exc.status_code,
         content=APIError(
