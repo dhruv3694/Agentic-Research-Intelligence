@@ -36,8 +36,12 @@ Agentic Research Intelligence is an open-source research platform for planning, 
   report-preparation, and supervisor roles in a real LangGraph `StateGraph`.
 - The response exposes shared workflow state and per-stage execution history;
   verifier-directed targeted research is capped at one retry.
-- Agent outputs are schema-validated, source references are checked against
-  retrieved evidence, and failures include sanitized stage errors.
+- Supported and partially supported claims require unique source references;
+  conflicting claims preserve references to at least two retrieved sources.
+- Per-query search outcomes and sanitized errors are included in the response.
+- Workflow execution is capped by `RESEARCH_WORKFLOW_TIMEOUT` (default 300
+  seconds; maximum 600). Source title, snippet, URL, source type, and metadata
+  are bounded by schema limits; SearXNG text truncation is marked in metadata.
 - Workflow state is in-memory per request. Checkpointing, durable history,
   resume, page crawling, and independent source/citation verification are not
   implemented.
@@ -179,6 +183,21 @@ Successful runs require an available configured Ollama model and a configured
 search provider. Failures are returned as an inspectable workflow response.
 Analysis uses search-result snippets, not fetched pages; verification is not
 independent fact-checking. State does not persist across requests or restarts.
+
+Workflow statuses mean:
+
+- `completed`: the graph finished without partial retrieval or unresolved
+  evidence classifications.
+- `partial`: the graph finished with partial retrieval, empty evidence,
+  partially supported, unsupported, or conflicting findings, or research gaps.
+- `failed`: an essential stage failed, all initial searches failed, or the
+  execution deadline expired.
+
+Each `retrieval_diagnostics` entry reports the query, success flag, result
+count, and sanitized error category/message when a query failed. A successful
+query returning no results is not itself a provider failure. Set
+`RESEARCH_WORKFLOW_TIMEOUT` in `.env` to configure the overall deadline; it
+covers retries as well as the initial plan and analysis.
 
 Example planning request:
 

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     search_max_results: int = Field(default=5, ge=1, le=20)
     research_max_subquestions: int = Field(default=5, ge=1, le=10)
     research_max_concurrent_searches: int = Field(default=3, ge=1, le=10)
+    research_workflow_timeout: float = Field(default=300.0, gt=0, le=600)
 
     model_config = SettingsConfigDict(
         env_file=".env",

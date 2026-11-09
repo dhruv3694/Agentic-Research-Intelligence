@@ -49,13 +49,41 @@ class SearXNGSearchProvider:
         for item in payload["results"]:
             if not isinstance(item, dict):
                 continue
-            metadata = {
-                key: item[key] for key in ("engine", "engines", "score", "category") if key in item
-            }
+            truncated_fields: list[str] = []
+            title = item.get("title")
+            snippet = item.get("content")
+            if isinstance(title, str) and len(title) > 500:
+                title = title[:500]
+                truncated_fields.append("title")
+            if isinstance(snippet, str) and len(snippet) > 4000:
+                snippet = snippet[:4000]
+                truncated_fields.append("snippet")
+            metadata: dict[str, Any] = {}
+            for key in ("engine", "engines", "score", "category"):
+                if key not in item:
+                    continue
+                value = item[key]
+                if isinstance(value, str):
+                    if len(value) > 500:
+                        value = value[:500]
+                        truncated_fields.append(f"metadata.{key}")
+                    metadata[key] = value
+                elif isinstance(value, list):
+                    strings = [entry for entry in value if isinstance(entry, str)]
+                    bounded = [entry[:150] for entry in strings[:10]]
+                    if len(strings) != len(value) or bounded != value:
+                        truncated_fields.append(f"metadata.{key}")
+                    metadata[key] = bounded
+                elif value is None or isinstance(value, int | float | bool):
+                    metadata[key] = value
+                else:
+                    truncated_fields.append(f"metadata.{key}")
+            if truncated_fields:
+                metadata["truncated_fields"] = truncated_fields
             raw_result: dict[str, Any] = {
-                "title": item.get("title"),
+                "title": title,
                 "url": item.get("url"),
-                "snippet": item.get("content"),
+                "snippet": snippet,
                 "source_type": "web",
                 "publication_date": item.get("publishedDate"),
                 "metadata": metadata,

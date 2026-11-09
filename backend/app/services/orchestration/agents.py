@@ -7,12 +7,15 @@ from pydantic import BaseModel, ValidationError
 from backend.app.schemas.research import (
     ResearchPlan,
     ResearchRequest,
+    ResearchStatus,
     ResearchSubQuestion,
 )
 from backend.app.schemas.sources import ResearchSource
 from backend.app.schemas.workflow import (
     AnalysisResult,
     AnalyticalFinding,
+    QueryRetrievalDiagnostic,
+    ReportConflict,
     ReportSection,
     ResearchReport,
     VerificationResult,
@@ -25,10 +28,16 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class AgentExecutionError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        state_updates: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.public_message = message
+        self.state_updates = state_updates or {}
 
 
 class PlannerAgent:
@@ -52,7 +61,13 @@ class ResearcherAgent:
         plan: ResearchPlan,
         previous_sources: list[ResearchSource],
         targeted_queries: list[str] | None = None,
-    ) -> tuple[list[ResearchSource], bool, list[str]]:
+    ) -> tuple[
+        list[ResearchSource],
+        bool,
+        list[str],
+        list[QueryRetrievalDiagnostic],
+        ResearchStatus,
+    ]:
         active_plan = plan
         if targeted_queries is not None:
             previous_queries = {
@@ -67,14 +82,14 @@ class ResearcherAgent:
                     new_queries.append(normalized)
                     seen.add(key)
             if not new_queries:
-                return previous_sources, False, []
+                return previous_sources, False, [], [], ResearchStatus.COMPLETED
             active_plan = ResearchPlan.model_validate(
                 {
                     **plan.model_dump(),
                     "sub_questions": [
                         ResearchSubQuestion(
                             id=f"target-{index}",
-                            question=f"{query}?",
+                            question=self._construct_targeted_question(query),
                         ).model_dump()
                         for index, query in enumerate(new_queries, start=1)
                     ],
@@ -85,6 +100,7 @@ class ResearcherAgent:
             research_id=research_id,
             question=question,
             plan=active_plan,
+            raise_on_complete_failure=False,
         )
         sources = list(previous_sources)
         known_ids = {source.source_id for source in sources}
@@ -93,7 +109,33 @@ class ResearcherAgent:
                 sources.append(source)
                 known_ids.add(source.source_id)
         attempted = [subquestion.question for subquestion in active_plan.sub_questions]
-        return sources, retrieval_result.status.value == "partial", attempted
+        return (
+            sources,
+            retrieval_result.status == ResearchStatus.PARTIAL,
+            attempted,
+            retrieval_result.query_results,
+            retrieval_result.status,
+        )
+
+    @staticmethod
+    def _construct_targeted_question(query: str) -> str:
+        normalized = " ".join(query.split())
+        if not 5 <= len(normalized) <= 500:
+            raise AgentExecutionError(
+                "invalid_retry_query",
+                "A verifier follow-up query did not fit the supported length.",
+            )
+        if normalized.endswith(("?", "!", ".")) or len(normalized) == 500:
+            question = normalized
+        else:
+            question = f"{normalized}?"
+        try:
+            return ResearchSubQuestion(id="target", question=question).question
+        except ValueError as exc:
+            raise AgentExecutionError(
+                "invalid_retry_query",
+                "A verifier follow-up query could not be validated.",
+            ) from exc
 
 
 class StructuredAgent:
@@ -226,10 +268,36 @@ class ReportPreparationAgent:
         sources: list[ResearchSource],
         retrieval_partial: bool,
     ) -> ResearchReport:
+        valid_source_ids = {source.source_id for source in sources}
+        finding_ids = [finding.finding_id for finding in findings]
+        if len(finding_ids) != len(set(finding_ids)):
+            raise AgentExecutionError(
+                "invalid_report_evidence",
+                "The report received duplicate finding IDs.",
+            )
         finding_by_id = {finding.finding_id: finding for finding in findings}
         verification_by_id = {claim.finding_id: claim for claim in verification.claims}
+        if set(verification_by_id) != set(finding_by_id):
+            raise AgentExecutionError(
+                "invalid_report_evidence",
+                "The report verification did not account for every finding.",
+            )
+        if any(not set(finding.source_ids).issubset(valid_source_ids) for finding in findings):
+            raise AgentExecutionError(
+                "invalid_report_evidence",
+                "A report finding referenced an unavailable source.",
+            )
+        if any(
+            not set(claim.source_ids).issubset(valid_source_ids) for claim in verification.claims
+        ):
+            raise AgentExecutionError(
+                "invalid_report_evidence",
+                "A verified claim referenced an unavailable source.",
+            )
+
         grouped: dict[str, list[str]] = {}
         source_ids: dict[str, list[str]] = {}
+        finding_sources: dict[str, dict[str, list[str]]] = {}
         for finding in findings:
             checked = verification_by_id.get(finding.finding_id)
             if checked is None or checked.status not in {
@@ -238,7 +306,13 @@ class ReportPreparationAgent:
             }:
                 continue
             grouped.setdefault(finding.group, []).append(finding.finding_id)
-            references = checked.source_ids or finding.source_ids
+            references = list(dict.fromkeys([*finding.source_ids, *checked.source_ids]))
+            if not references:
+                raise AgentExecutionError(
+                    "invalid_report_evidence",
+                    "A supported report finding has no source references.",
+                )
+            finding_sources.setdefault(finding.group, {})[finding.finding_id] = references
             source_ids[finding.group] = list(
                 dict.fromkeys(source_ids.get(finding.group, []) + references)
             )
@@ -248,12 +322,17 @@ class ReportPreparationAgent:
                 heading=group,
                 finding_ids=finding_ids,
                 source_ids=source_ids.get(group, []),
+                finding_sources=finding_sources[group],
             )
             for group, finding_ids in grouped.items()
         ]
         conflicts = [
-            f"Conflicting evidence for {finding_by_id[claim.finding_id].claim}: "
-            f"{claim.rationale}"
+            ReportConflict(
+                finding_id=claim.finding_id,
+                claim=finding_by_id[claim.finding_id].claim,
+                rationale=claim.rationale,
+                source_ids=claim.source_ids,
+            )
             for claim in verification.claims
             if claim.status == "conflicting" and claim.finding_id in finding_by_id
         ]

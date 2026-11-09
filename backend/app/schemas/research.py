@@ -12,6 +12,7 @@ class ResearchStatus(StrEnum):
     PLANNED = "planned"
     COMPLETED = "completed"
     PARTIAL = "partial"
+    FAILED = "failed"
 
 
 class ResearchRequest(BaseModel):
@@ -93,6 +94,22 @@ class SearchFailure(BaseModel):
     message: str
 
 
+class QueryRetrievalDiagnostic(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    succeeded: bool
+    result_count: int = Field(ge=0)
+    error_code: str | None = None
+    error_message: str | None = None
+
+    @model_validator(mode="after")
+    def validate_error_fields(self) -> "QueryRetrievalDiagnostic":
+        if self.succeeded and (self.error_code is not None or self.error_message is not None):
+            raise ValueError("successful queries cannot contain error details")
+        if not self.succeeded and (self.error_code is None or self.error_message is None):
+            raise ValueError("failed queries must contain sanitized error details")
+        return self
+
+
 class ResearchRetrievalResponse(BaseModel):
     research_id: UUID
     question: str
@@ -100,3 +117,4 @@ class ResearchRetrievalResponse(BaseModel):
     status: ResearchStatus
     sources: list[ResearchSource]
     failures: list[SearchFailure] = Field(default_factory=list)
+    query_results: list[QueryRetrievalDiagnostic] = Field(default_factory=list)

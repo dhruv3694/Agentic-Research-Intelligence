@@ -71,6 +71,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         planner=application.state.research_planner,
         retrieval=application.state.research_retrieval_service,
         llm=provider,
+        timeout_seconds=settings.research_workflow_timeout,
     )
     logger.info("Application startup complete.")
     try:

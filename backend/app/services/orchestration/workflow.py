@@ -1,7 +1,8 @@
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -29,8 +30,6 @@ from backend.app.services.research.retrieval import ResearchRetrievalService
 from backend.app.services.search.base import SearchProviderError
 
 logger = logging.getLogger(__name__)
-
-AgentNode = Callable[[ResearchWorkflowState], Awaitable[dict[str, Any]]]
 
 
 class SupervisorAgent:
@@ -70,9 +69,12 @@ class ResearchWorkflow:
         retrieval: ResearchRetrievalService,
         llm: LLMProvider,
         max_retries: int = 1,
+        timeout_seconds: float = 300,
     ) -> None:
         if not 0 <= max_retries <= 1:
             raise ValueError("max_retries must be between 0 and 1")
+        if not 0 < timeout_seconds <= 600:
+            raise ValueError("timeout_seconds must be greater than 0 and at most 600")
         self._planner = PlannerAgent(planner)
         self._researcher = ResearcherAgent(retrieval)
         self._analyst = AnalystAgent(llm)
@@ -80,6 +82,7 @@ class ResearchWorkflow:
         self._reporter = ReportPreparationAgent()
         self._supervisor = SupervisorAgent()
         self._max_retries = max_retries
+        self._timeout_seconds = timeout_seconds
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -99,7 +102,11 @@ class ResearchWorkflow:
             "verifier",
             "report_preparation",
         ):
-            builder.add_edge(node, "supervisor")
+            builder.add_conditional_edges(
+                node,
+                self._after_agent_route,
+                {"supervisor": "supervisor", END: END},
+            )
         builder.add_conditional_edges(
             "supervisor",
             self._route,
@@ -115,12 +122,17 @@ class ResearchWorkflow:
         return builder.compile()
 
     @staticmethod
+    def _after_agent_route(state: ResearchWorkflowState) -> str:
+        return END if state.get("status") == WorkflowStatus.FAILED else "supervisor"
+
+    @staticmethod
     def _route(state: ResearchWorkflowState) -> WorkflowStage:
         return state.get("next_stage", WorkflowStage.END)
 
     async def run(self, question: str, max_subquestions: int) -> ResearchWorkflowRunResponse:
         research_id = uuid4()
         started_at = datetime.now(UTC)
+        deadline_monotonic = monotonic() + self._timeout_seconds
         initial_state: ResearchWorkflowState = {
             "research_id": str(research_id),
             "question": question,
@@ -135,6 +147,7 @@ class ResearchWorkflow:
             "execution_history": [],
             "errors": [],
             "retrieval_partial": False,
+            "retrieval_diagnostics": [],
             "attempted_queries": [],
             "targeted_queries": [],
             "retry_count": 0,
@@ -142,6 +155,7 @@ class ResearchWorkflow:
             "status": WorkflowStatus.RUNNING,
             "started_at": started_at,
             "completed_at": None,
+            "deadline_monotonic": deadline_monotonic,
         }
         final_state = await self.graph.ainvoke(
             initial_state,
@@ -163,6 +177,7 @@ class ResearchWorkflow:
             max_retries=final_state.get("max_retries", self._max_retries),
             attempted_queries=final_state.get("attempted_queries", []),
             retrieval_partial=final_state.get("retrieval_partial", False),
+            retrieval_diagnostics=final_state.get("retrieval_diagnostics", []),
             started_at=started_at,
             completed_at=completed_at,
             errors=final_state.get("errors", []),
@@ -171,6 +186,32 @@ class ResearchWorkflow:
     async def _supervisor_node(self, state: ResearchWorkflowState) -> dict[str, Any]:
         started = datetime.now(UTC)
         timer = perf_counter()
+        if monotonic() >= state["deadline_monotonic"]:
+            ended = datetime.now(UTC)
+            execution = AgentExecution(
+                agent_name=WorkflowStage.SUPERVISOR,
+                started_at=started,
+                ended_at=ended,
+                status="failed",
+                duration_ms=round((perf_counter() - timer) * 1000),
+                retry_count=state.get("retry_count", 0),
+                error_code="workflow_timeout",
+            )
+            return {
+                "current_stage": WorkflowStage.SUPERVISOR,
+                "next_stage": WorkflowStage.END,
+                "status": WorkflowStatus.FAILED,
+                "completed_at": ended,
+                "errors": state.get("errors", [])
+                + [
+                    WorkflowError(
+                        stage=WorkflowStage.SUPERVISOR,
+                        code="workflow_timeout",
+                        message="The research workflow exceeded its execution deadline.",
+                    )
+                ],
+                "execution_history": state.get("execution_history", []) + [execution],
+            }
         target = self._supervisor.route(state)
         retry_count = state.get("retry_count", 0)
         if (
@@ -189,7 +230,7 @@ class ResearchWorkflow:
                     and (
                         verification.research_gaps
                         or any(
-                            claim.status in {"unsupported", "conflicting"}
+                            claim.status in {"partially_supported", "unsupported", "conflicting"}
                             for claim in verification.claims
                         )
                     )
@@ -235,17 +276,36 @@ class ResearchWorkflow:
             if plan is None:
                 raise AgentExecutionError("missing_plan", "The research plan is unavailable.")
             targets = state.get("targeted_queries", [])
-            sources, partial, attempted = await self._researcher.run(
+            (
+                sources,
+                partial,
+                attempted,
+                diagnostics,
+                retrieval_status,
+            ) = await self._researcher.run(
                 research_id=UUID(state["research_id"]),
                 question=state["question"],
                 plan=plan,
                 previous_sources=state.get("sources", []),
                 targeted_queries=targets if targets else None,
             )
+            previous_sources = state.get("sources", [])
+            all_diagnostics = state.get("retrieval_diagnostics", []) + diagnostics
+            if retrieval_status.value == "failed" and not previous_sources:
+                raise AgentExecutionError(
+                    "search_unavailable",
+                    "All research queries failed; no evidence could be retrieved.",
+                    state_updates={"retrieval_diagnostics": all_diagnostics},
+                )
             known_queries = set(state.get("attempted_queries", []))
             return {
                 "sources": sources,
-                "retrieval_partial": state.get("retrieval_partial", False) or partial,
+                "retrieval_partial": (
+                    state.get("retrieval_partial", False)
+                    or partial
+                    or (retrieval_status.value == "failed" and bool(previous_sources))
+                ),
+                "retrieval_diagnostics": all_diagnostics,
                 "attempted_queries": list(dict.fromkeys([*known_queries, *attempted])),
                 "targeted_queries": [],
                 "next_stage": WorkflowStage.ANALYST,
@@ -319,61 +379,50 @@ class ResearchWorkflow:
         started_at = datetime.now(UTC)
         timer = perf_counter()
         try:
-            result = await action()
+            remaining = state["deadline_monotonic"] - monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(remaining):
+                result = await action()
+            if monotonic() >= state["deadline_monotonic"]:
+                raise TimeoutError
+        except TimeoutError:
+            logger.warning("Research workflow deadline reached (%s).", stage.value)
+            return self._failed_stage_update(
+                state,
+                stage,
+                started_at,
+                timer,
+                "workflow_timeout",
+                "The research workflow exceeded its execution deadline.",
+            )
         except (AgentExecutionError, SearchProviderError) as exc:
             code = exc.code
             message = getattr(exc, "public_message", "A workflow agent could not complete.")
             logger.warning("Research workflow stage failed (%s, %s).", stage.value, code)
-            ended_at = datetime.now(UTC)
-            record = AgentExecution(
-                agent_name=stage,
-                started_at=started_at,
-                ended_at=ended_at,
-                status="failed",
-                duration_ms=round((perf_counter() - timer) * 1000),
-                retry_count=state.get("retry_count", 0),
-                error_code=code,
+            return self._failed_stage_update(
+                state,
+                stage,
+                started_at,
+                timer,
+                code,
+                message,
+                getattr(exc, "state_updates", {}),
             )
-            return {
-                "current_stage": stage,
-                "next_stage": WorkflowStage.END,
-                "status": WorkflowStatus.FAILED,
-                "completed_at": ended_at,
-                "errors": state.get("errors", [])
-                + [WorkflowError(stage=stage, code=code, message=message)],
-                "execution_history": state.get("execution_history", []) + [record],
-            }
         except Exception as exc:
             logger.error(
                 "Unexpected research workflow stage failure (%s, %s).",
                 stage.value,
                 type(exc).__name__,
             )
-            ended_at = datetime.now(UTC)
-            record = AgentExecution(
-                agent_name=stage,
-                started_at=started_at,
-                ended_at=ended_at,
-                status="failed",
-                duration_ms=round((perf_counter() - timer) * 1000),
-                retry_count=state.get("retry_count", 0),
-                error_code="internal_agent_error",
+            return self._failed_stage_update(
+                state,
+                stage,
+                started_at,
+                timer,
+                "internal_agent_error",
+                "An internal workflow stage failed.",
             )
-            return {
-                "current_stage": stage,
-                "next_stage": WorkflowStage.END,
-                "status": WorkflowStatus.FAILED,
-                "completed_at": ended_at,
-                "errors": state.get("errors", [])
-                + [
-                    WorkflowError(
-                        stage=stage,
-                        code="internal_agent_error",
-                        message="An internal workflow stage failed.",
-                    )
-                ],
-                "execution_history": state.get("execution_history", []) + [record],
-            }
 
         ended_at = datetime.now(UTC)
         record = AgentExecution(
@@ -387,5 +436,36 @@ class ResearchWorkflow:
         return {
             **result,
             "current_stage": stage,
+            "execution_history": state.get("execution_history", []) + [record],
+        }
+
+    @staticmethod
+    def _failed_stage_update(
+        state: ResearchWorkflowState,
+        stage: WorkflowStage,
+        started_at: datetime,
+        timer: float,
+        code: str,
+        message: str,
+        state_updates: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        ended_at = datetime.now(UTC)
+        record = AgentExecution(
+            agent_name=stage,
+            started_at=started_at,
+            ended_at=ended_at,
+            status="failed",
+            duration_ms=round((perf_counter() - timer) * 1000),
+            retry_count=state.get("retry_count", 0),
+            error_code=code,
+        )
+        return {
+            **(state_updates or {}),
+            "current_stage": stage,
+            "next_stage": WorkflowStage.END,
+            "status": WorkflowStatus.FAILED,
+            "completed_at": ended_at,
+            "errors": state.get("errors", [])
+            + [WorkflowError(stage=stage, code=code, message=message)],
             "execution_history": state.get("execution_history", []) + [record],
         }

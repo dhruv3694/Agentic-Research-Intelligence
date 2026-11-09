@@ -55,6 +55,29 @@ def test_searxng_search_normalizes_result_and_limits_results():
     assert requests[0].url.params["format"] == "json"
 
 
+def test_searxng_truncates_long_text_and_marks_truncated_fields():
+    handler = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "T" * 700,
+                        "url": "https://example.org/article",
+                        "content": "S" * 5000,
+                    }
+                ]
+            },
+        )
+    )
+
+    result = search_with(handler)[0]
+
+    assert result.title == "T" * 500
+    assert result.snippet == "S" * 4000
+    assert result.metadata["truncated_fields"] == ["title", "snippet"]
+
+
 @pytest.mark.parametrize("payload", [{}, {"results": "not a list"}])
 def test_searxng_rejects_malformed_response(payload):
     handler = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
