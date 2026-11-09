@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     ollama_timeout: float = Field(default=120.0, gt=0, le=600)
     ollama_temperature: float = Field(default=0.2, ge=0, le=2)
     ollama_num_ctx: int = Field(default=4096, ge=1, le=32768)
+    search_provider: str = "disabled"
+    searxng_base_url: str = "http://localhost:8080"
+    search_timeout: float = Field(default=15.0, gt=0, le=120)
+    search_max_results: int = Field(default=5, ge=1, le=20)
+    research_max_subquestions: int = Field(default=5, ge=1, le=10)
+    research_max_concurrent_searches: int = Field(default=3, ge=1, le=10)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -65,6 +71,33 @@ class Settings(BaseSettings):
         normalized = value.strip()
         if not normalized:
             raise ValueError("ollama_model must not be empty")
+        return normalized
+
+    @field_validator("search_provider")
+    @classmethod
+    def validate_search_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "searxng"}:
+            raise ValueError("search_provider must be one of: disabled, searxng")
+        return normalized
+
+    @field_validator("searxng_base_url")
+    @classmethod
+    def validate_searxng_base_url(cls, value: str) -> str:
+        normalized = value.rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError(
+                "searxng_base_url must be an HTTP(S) origin without credentials or a path"
+            )
         return normalized
 
 

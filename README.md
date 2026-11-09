@@ -21,6 +21,17 @@ Agentic Research Intelligence is an open-source research platform for planning, 
 
 Research agents, RAG, and multi-agent orchestration are not implemented yet.
 
+### Phase 3 — Research planning and retrieval foundation (complete; mocked validation)
+
+- Research plans use the configured Ollama model when available and a clearly
+  labeled deterministic fallback when it is unavailable.
+- Optional search and source normalization use a provider interface. SearXNG
+  is the initial adapter; search is disabled by default.
+- Retrieval searches planned sub-questions concurrently with a configurable
+  bound and deduplicates results without fetching source URLs.
+- Reports, citations verification, browser agents, embeddings, vector stores,
+  and autonomous multi-agent workflows are not implemented.
+
 ## Repository structure
 
 ```text
@@ -31,7 +42,9 @@ agentic-research-intelligence/
 │   │   ├── core/
 │   │   ├── schemas/
 │   │   ├── services/
-│   │   │   └── llm/
+│   │   │   ├── llm/
+│   │   │   ├── research/
+│   │   │   └── search/
 │   │   ├── __init__.py
 │   │   └── main.py
 │   └── tests/
@@ -117,6 +130,49 @@ See [Local LLM setup](docs/development/local-llm-setup.md) for detailed
 PowerShell instructions and [LLM architecture](docs/architecture/llm-integration.md)
 for the provider design.
 
+## Research planning and retrieval
+
+Planning and retrieval are separate operations. `POST /api/v1/research/plan`
+returns an LLM-generated or explicitly marked deterministic fallback plan.
+`POST /api/v1/research/retrieve` accepts that plan and searches each
+sub-question through the configured provider, normalizes sources, and
+deduplicates URLs. It does not crawl pages or generate a research report.
+
+Search is disabled by default; without an external search instance, retrieval
+returns a clear `search_unavailable` error and never fabricates results.
+SearXNG is an optional self-hosted adapter. SearXNG is licensed under
+AGPL-3.0 and requires a separately deployed instance; see the [Search provider
+setup guide](docs/development/search-provider-setup.md). Consult the
+[research architecture](docs/architecture/research-foundation.md) for the
+planning, retrieval, and source-processing boundaries.
+
+Example planning request:
+
+```powershell
+$plan = Invoke-RestMethod -Method Post `
+    -Uri http://localhost:8000/api/v1/research/plan `
+    -ContentType "application/json" `
+    -Body (@{
+        question = "How is generative AI changing the FinTech industry?"
+        max_subquestions = 5
+    } | ConvertTo-Json)
+$plan
+```
+
+Once a search provider is configured, retrieve sources using the returned plan:
+
+```powershell
+$retrieval = @{
+    research_id = $plan.research_id
+    question = $plan.question
+    plan = $plan.plan
+} | ConvertTo-Json -Depth 10
+Invoke-RestMethod -Method Post `
+    -Uri http://localhost:8000/api/v1/research/retrieve `
+    -ContentType "application/json" `
+    -Body $retrieval
+```
+
 ### API examples
 
 ```powershell
@@ -141,7 +197,7 @@ the backend. Prompts are not logged by the application.
 
 - [x] Phase 1: Python backend foundation
 - [x] Phase 2: Local Ollama integration (verified by mocked tests)
-- [ ] Phase 3: Research planning and retrieval foundations
+- [x] Phase 3: Research planning and retrieval foundations (verified by mocked tests)
 
 
 ## Testing

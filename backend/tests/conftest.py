@@ -59,6 +59,7 @@ def ollama() -> MockOllama:
 
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch, ollama: MockOllama) -> Iterator[TestClient]:
+    monkeypatch.setattr(settings, "search_provider", "disabled")
     monkeypatch.setattr(
         main,
         "create_ollama_http_client",
