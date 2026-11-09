@@ -1,4 +1,7 @@
-from backend.app.core.config import settings
+import pytest
+from pydantic import ValidationError
+
+from backend.app.core.config import Settings, settings
 
 
 def test_root_endpoint(client):
@@ -30,6 +33,15 @@ def test_openapi_schema_available(client):
     schema = response.json()
     assert schema["info"]["title"] == settings.app_name
     assert schema["info"]["version"] == settings.app_version
+    generate_operation = schema["paths"]["/api/v1/llm/generate"]["post"]
+    assert generate_operation["requestBody"]["content"]["application/json"]
+    assert "200" in generate_operation["responses"]
+    assert "422" in generate_operation["responses"]
+    assert "504" in generate_operation["responses"]
+    assert (
+        schema["components"]["schemas"]["GenerateRequest"]["properties"]["prompt"]["maxLength"]
+        == 20_000
+    )
 
 
 def test_docs_endpoint_available(client):
@@ -42,3 +54,20 @@ def test_configuration_defaults():
     assert settings.app_name == "Agentic Research Intelligence"
     assert settings.app_version == "0.1.0"
     assert settings.app_env in {"development", "test", "production"}
+    assert settings.ollama_model == "qwen3:4b"
+    assert settings.ollama_timeout > 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"ollama_timeout": 0},
+        {"ollama_temperature": 2.1},
+        {"ollama_num_ctx": 0},
+        {"ollama_base_url": "http://user:password@localhost:11434"},
+        {"ollama_model": "  "},
+    ],
+)
+def test_invalid_ollama_configuration_is_rejected(values):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **values)
