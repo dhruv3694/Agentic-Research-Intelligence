@@ -13,6 +13,7 @@ from backend.app.schemas.llm import APIError, APIErrorDetail
 from backend.app.services.llm.base import LLMProviderError
 from backend.app.services.llm.manager import LLMManager
 from backend.app.services.llm.ollama_provider import OllamaProvider
+from backend.app.services.orchestration.workflow import ResearchWorkflow
 from backend.app.services.research.planner import ResearchPlanner
 from backend.app.services.research.retrieval import ResearchRetrievalService
 from backend.app.services.research.source_processor import SourceProcessor
@@ -65,6 +66,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         source_processor=SourceProcessor(),
         max_results=settings.search_max_results,
         max_concurrent_searches=settings.research_max_concurrent_searches,
+    )
+    application.state.research_workflow = ResearchWorkflow(
+        planner=application.state.research_planner,
+        retrieval=application.state.research_retrieval_service,
+        llm=provider,
     )
     logger.info("Application startup complete.")
     try:

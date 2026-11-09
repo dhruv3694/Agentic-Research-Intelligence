@@ -122,6 +122,25 @@ def test_research_routes_are_documented_in_openapi(client):
 
     assert "/api/v1/research/plan" in schema["paths"]
     assert "/api/v1/research/retrieve" in schema["paths"]
+    assert "/api/v1/research/run" in schema["paths"]
+
+
+def test_run_endpoint_returns_inspectable_failed_workflow_when_search_is_disabled(client):
+    response = client.post(
+        "/api/v1/research/run",
+        json={"question": "How is AI changing finance?"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "failed"
+    assert result["plan"]["generated_by"] == "deterministic_fallback"
+    assert result["errors"][0]["stage"] == "researcher"
+    assert result["errors"][0]["code"] == "search_unavailable"
+    assert any(
+        item["agent_name"] == "planner" and item["status"] == "succeeded"
+        for item in result["execution_history"]
+    )
 
 
 def test_retrieve_endpoint_rejects_invalid_plan_shape(client):
