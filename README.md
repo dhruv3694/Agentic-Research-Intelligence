@@ -1,6 +1,6 @@
 # Agentic Research Intelligence
 
-Agentic Research Intelligence is an open-source research platform for planning, gathering, verifying, and summarizing evidence from the web and structured sources. This repository includes a FastAPI backend foundation and a local Ollama LLM integration.
+Agentic Research Intelligence is an open-source research platform for planning, gathering, verifying, and summarizing evidence from the web and structured sources. This repository includes a FastAPI backend with local Ollama integration and a LangGraph research workflow.
 
 ## Project status
 
@@ -19,8 +19,6 @@ Agentic Research Intelligence is an open-source research platform for planning, 
 - Ollama status, model-listing, and generation endpoints
 - Mocked HTTP tests; no Ollama runtime is required for CI
 
-Research agents, RAG, and multi-agent orchestration are not implemented yet.
-
 ### Phase 3 — Research planning and retrieval foundation (complete; mocked validation)
 
 - Research plans use the configured Ollama model when available and a clearly
@@ -29,8 +27,24 @@ Research agents, RAG, and multi-agent orchestration are not implemented yet.
   is the initial adapter; search is disabled by default.
 - Retrieval searches planned sub-questions concurrently with a configurable
   bound and deduplicates results without fetching source URLs.
-- Reports, citations verification, browser agents, embeddings, vector stores,
-  and autonomous multi-agent workflows are not implemented.
+- The standalone planning and retrieval endpoints are also available for clients
+  that want to inspect or run those steps separately.
+
+### Phase 4 — LangGraph research workflow (implemented; mocked validation)
+
+- `POST /api/v1/research/run` composes planner, researcher, analyst, verifier,
+  report-preparation, and supervisor roles in a real LangGraph `StateGraph`.
+- The response exposes shared workflow state and per-stage execution history;
+  verifier-directed targeted research is capped at one retry.
+- Supported and partially supported claims require unique source references;
+  conflicting claims preserve references to at least two retrieved sources.
+- Per-query search outcomes and sanitized errors are included in the response.
+- Workflow execution is capped by `RESEARCH_WORKFLOW_TIMEOUT` (default 300
+  seconds; maximum 600). Source title, snippet, URL, source type, and metadata
+  are bounded by schema limits; SearXNG text truncation is marked in metadata.
+- Workflow state is in-memory per request. Checkpointing, durable history,
+  resume, page crawling, and independent source/citation verification are not
+  implemented.
 
 ## Repository structure
 
@@ -43,6 +57,7 @@ agentic-research-intelligence/
 │   │   ├── schemas/
 │   │   ├── services/
 │   │   │   ├── llm/
+│   │   │   ├── orchestration/
 │   │   │   ├── research/
 │   │   │   └── search/
 │   │   ├── __init__.py
@@ -132,11 +147,14 @@ for the provider design.
 
 ## Research planning and retrieval
 
-Planning and retrieval are separate operations. `POST /api/v1/research/plan`
+Planning and retrieval can be called separately or as part of the end-to-end
+LangGraph workflow. `POST /api/v1/research/plan`
 returns an LLM-generated or explicitly marked deterministic fallback plan.
 `POST /api/v1/research/retrieve` accepts that plan and searches each
 sub-question through the configured provider, normalizes sources, and
-deduplicates URLs. It does not crawl pages or generate a research report.
+deduplicates URLs. The workflow at `POST /api/v1/research/run` composes those
+services with structured analysis, verification, and deterministic report
+preparation; it does not crawl source pages.
 
 Search is disabled by default; without an external search instance, retrieval
 returns a clear `search_unavailable` error and never fabricates results.
@@ -144,7 +162,42 @@ SearXNG is an optional self-hosted adapter. SearXNG is licensed under
 AGPL-3.0 and requires a separately deployed instance; see the [Search provider
 setup guide](docs/development/search-provider-setup.md). Consult the
 [research architecture](docs/architecture/research-foundation.md) for the
-planning, retrieval, and source-processing boundaries.
+planning, retrieval, and source-processing boundaries, and the [agentic
+workflow architecture](docs/architecture/agentic-workflow.md) for graph
+routing, evidence limitations, and the workflow API.
+
+To run the composed workflow:
+
+```powershell
+$body = @{
+    question = "How is generative AI changing financial services?"
+    max_subquestions = 5
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+    -Uri http://localhost:8000/api/v1/research/run `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+Successful runs require an available configured Ollama model and a configured
+search provider. Failures are returned as an inspectable workflow response.
+Analysis uses search-result snippets, not fetched pages; verification is not
+independent fact-checking. State does not persist across requests or restarts.
+
+Workflow statuses mean:
+
+- `completed`: the graph finished without partial retrieval or unresolved
+  evidence classifications.
+- `partial`: the graph finished with partial retrieval, empty evidence,
+  partially supported, unsupported, or conflicting findings, or research gaps.
+- `failed`: an essential stage failed, all initial searches failed, or the
+  execution deadline expired.
+
+Each `retrieval_diagnostics` entry reports the query, success flag, result
+count, and sanitized error category/message when a query failed. A successful
+query returning no results is not itself a provider failure. Set
+`RESEARCH_WORKFLOW_TIMEOUT` in `.env` to configure the overall deadline; it
+covers retries as well as the initial plan and analysis.
 
 Example planning request:
 
@@ -198,6 +251,7 @@ the backend. Prompts are not logged by the application.
 - [x] Phase 1: Python backend foundation
 - [x] Phase 2: Local Ollama integration (verified by mocked tests)
 - [x] Phase 3: Research planning and retrieval foundations (verified by mocked tests)
+- [x] Phase 4: LangGraph orchestration and run API (verified by mocked tests)
 
 
 ## Testing

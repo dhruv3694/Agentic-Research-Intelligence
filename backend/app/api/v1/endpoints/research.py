@@ -11,6 +11,8 @@ from backend.app.schemas.research import (
     ResearchRetrievalResponse,
     ResearchStatus,
 )
+from backend.app.schemas.workflow import ResearchWorkflowRunResponse
+from backend.app.services.orchestration.workflow import ResearchWorkflow
 from backend.app.services.research.planner import ResearchPlanner
 from backend.app.services.research.retrieval import ResearchRetrievalService
 
@@ -23,6 +25,10 @@ def get_research_planner(request: Request) -> ResearchPlanner:
 
 def get_retrieval_service(request: Request) -> ResearchRetrievalService:
     return request.app.state.research_retrieval_service
+
+
+def get_research_workflow(request: Request) -> ResearchWorkflow:
+    return request.app.state.research_workflow
 
 
 @router.post(
@@ -65,3 +71,15 @@ async def retrieve_research_sources(
         question=request.question,
         plan=request.plan,
     )
+
+
+@router.post(
+    "/run",
+    response_model=ResearchWorkflowRunResponse,
+    responses={422: {"model": APIError}},
+)
+async def run_research_workflow(
+    request: ResearchRequest,
+    workflow: Annotated[ResearchWorkflow, Depends(get_research_workflow)],
+) -> ResearchWorkflowRunResponse:
+    return await workflow.run(request.question, request.max_subquestions)

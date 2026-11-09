@@ -3,6 +3,7 @@ import logging
 from uuid import UUID
 
 from backend.app.schemas.research import (
+    QueryRetrievalDiagnostic,
     ResearchPlan,
     ResearchRetrievalResponse,
     ResearchStatus,
@@ -33,6 +34,7 @@ class ResearchRetrievalService:
         research_id: UUID,
         question: str,
         plan: ResearchPlan,
+        raise_on_complete_failure: bool = True,
     ) -> ResearchRetrievalResponse:
         async def search_one(
             query: str,
@@ -55,7 +57,17 @@ class ResearchRetrievalService:
         ]
         successful = [(query, results) for query, results, error in searched if error is None]
 
-        if failures and not successful:
+        query_results = [
+            QueryRetrievalDiagnostic(
+                query=query,
+                succeeded=error is None,
+                result_count=len(results),
+                error_code=error.code if error is not None else None,
+                error_message=error.public_message if error is not None else None,
+            )
+            for query, results, error in searched
+        ]
+        if failures and not successful and raise_on_complete_failure:
             error = next(error for _, _, error in searched if error is not None)
             raise error
 
@@ -70,7 +82,14 @@ class ResearchRetrievalService:
             research_id=research_id,
             question=question,
             plan=plan,
-            status=ResearchStatus.PARTIAL if failures else ResearchStatus.COMPLETED,
+            status=(
+                ResearchStatus.FAILED
+                if failures and not successful
+                else ResearchStatus.PARTIAL
+                if failures
+                else ResearchStatus.COMPLETED
+            ),
             sources=normalized,
             failures=failures,
+            query_results=query_results,
         )

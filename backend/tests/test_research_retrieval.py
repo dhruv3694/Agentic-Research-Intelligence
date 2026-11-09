@@ -8,7 +8,7 @@ from backend.app.schemas.research import (
     ResearchRequest,
     ResearchStatus,
 )
-from backend.app.schemas.sources import SearchResult
+from backend.app.schemas.sources import ResearchSource, SearchResult
 from backend.app.services.research.retrieval import ResearchRetrievalService
 from backend.app.services.research.source_processor import SourceProcessor
 from backend.app.services.search.base import SearchTimeoutError, SearchUnavailableError
@@ -93,6 +93,41 @@ def test_source_rejects_unsafe_urls(url):
         SearchResult(url=url)
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"title": "t" * 501},
+        {"snippet": "s" * 4001},
+        {"url": f"https://example.org/{'x' * 2048}"},
+        {"source_type": "s" * 65},
+        {"metadata": {f"key-{index}": "value" for index in range(21)}},
+        {"metadata": {"oversized": "m" * 501}},
+        {"metadata": {"nested": {"unbounded": "value"}}},
+    ],
+)
+def test_search_result_rejects_unbounded_source_fields(values):
+    payload = {"url": "https://example.org/source", **values}
+    with pytest.raises(ValueError):
+        SearchResult(**payload)
+
+
+def test_research_source_enforces_source_data_limits():
+    with pytest.raises(ValueError):
+        ResearchSource(
+            source_id="src",
+            title="T" * 501,
+            url="https://example.org/source",
+            original_query="A valid research query",
+        )
+    with pytest.raises(ValueError):
+        ResearchSource(
+            source_id="src",
+            description="S" * 4001,
+            url="https://example.org/source",
+            original_query="A valid research query",
+        )
+
+
 def test_retrieval_searches_all_subquestions_and_deduplicates_globally():
     provider = FakeSearchProvider()
     service = ResearchRetrievalService(provider, SourceProcessor(), 5, 2)
@@ -104,6 +139,11 @@ def test_retrieval_searches_all_subquestions_and_deduplicates_globally():
     assert len(provider.queries) == 3
     assert len(response.sources) == 4
     assert response.status == ResearchStatus.COMPLETED
+    assert len(response.query_results) == 3
+    assert all(item.succeeded and item.result_count == 2 for item in response.query_results)
+    assert all(
+        item.error_code is None and item.error_message is None for item in response.query_results
+    )
     assert response.sources[0].original_query == provider.queries[0]
     assert response.sources[1].original_query == provider.queries[0]
 
@@ -129,6 +169,13 @@ def test_retrieval_returns_partial_failures_without_hiding_them():
     assert response.status == ResearchStatus.PARTIAL
     assert len(response.failures) == 1
     assert response.failures[0].code == "search_timeout"
+    assert len(response.sources) > 0
+    failed = [item for item in response.query_results if not item.succeeded]
+    successful = [item for item in response.query_results if item.succeeded]
+    assert len(failed) == 1
+    assert failed[0].error_code == "search_timeout"
+    assert failed[0].error_message == "The search provider request timed out."
+    assert len(successful) == 1
 
 
 def test_retrieval_fails_explicitly_when_all_searches_fail():
@@ -144,3 +191,46 @@ def test_retrieval_fails_explicitly_when_all_searches_fail():
 
     with pytest.raises(SearchUnavailableError):
         asyncio.run(service.retrieve(uuid4(), "How is AI changing financial services?", plan))
+
+
+def test_retrieval_returns_all_failure_diagnostics_for_workflow_mode():
+    class Unavailable:
+        async def search(self, query, limit):
+            raise SearchUnavailableError
+
+    plan = make_plan(3)
+    service = ResearchRetrievalService(Unavailable(), SourceProcessor(), 5, 2)
+
+    response = asyncio.run(
+        service.retrieve(
+            uuid4(),
+            "How is AI changing financial services?",
+            plan,
+            raise_on_complete_failure=False,
+        )
+    )
+
+    assert response.status == ResearchStatus.FAILED
+    assert response.sources == []
+    assert len(response.query_results) == 3
+    assert all(not item.succeeded for item in response.query_results)
+    assert all(item.result_count == 0 for item in response.query_results)
+    assert all(item.error_code == "search_unavailable" for item in response.query_results)
+    assert all("localhost" not in item.error_message for item in response.query_results)
+
+
+def test_empty_search_results_are_success_not_provider_failure():
+    class EmptyResults:
+        async def search(self, query, limit):
+            return []
+
+    plan = make_plan(2)
+    service = ResearchRetrievalService(EmptyResults(), SourceProcessor(), 5, 2)
+
+    response = asyncio.run(
+        service.retrieve(uuid4(), "How is AI changing financial services?", plan)
+    )
+
+    assert response.status == ResearchStatus.COMPLETED
+    assert response.sources == []
+    assert all(item.succeeded and item.result_count == 0 for item in response.query_results)
